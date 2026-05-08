@@ -22,6 +22,8 @@ public class Slime : MonoBehaviour
     [SerializeField] private CircleCollider2D outerCollider;
     [SerializeField] private CircleCollider2D innerCollider;
     [SerializeField] private Slider viscositySlider;
+    [SerializeField] private GameObject pushSlimObject;
+    [SerializeField] private GameObject clearObject;
 
     [Header("Legacy Tuning")]
     [SerializeField] private float maxOuterOvershoot = 28f;
@@ -29,7 +31,9 @@ public class Slime : MonoBehaviour
 
     [Header("Pseudo Haptics")]
     [SerializeField] private float membraneThickness = 24f;
-    [SerializeField, Range(0.01f, 0.5f)] private float insideViscosity = 0.055f;
+    [SerializeField, Range(0f, 1f)] private float insideViscosityAmount = 0.75f;
+    [SerializeField, Range(0.005f, 0.2f)] private float minInsideFollowRate = 0.01f;
+    [SerializeField, Range(0.01f, 0.5f)] private float maxInsideFollowRate = 0.11f;
     [SerializeField, Range(0.1f, 1f)] private float insideDragMultiplier = 0.2f;
     [SerializeField, Range(0.8f, 1f)] private float outsideFollowRate = 0.98f;
     [SerializeField, Range(0.1f, 1f)] private float breakthroughLerpRate = 0.34f;
@@ -40,7 +44,13 @@ public class Slime : MonoBehaviour
     [SerializeField] private float failedPushReleaseSpeed = 0.32f;
     [SerializeField] private float cursorJitterAmount = 2.2f;
     [SerializeField] private float visualSquashAmount = 0.1f;
+    [SerializeField] private float outerMembraneForceSpeed = 90f;
+    [SerializeField] private float innerMembraneForceSpeed = 130f;
+    [SerializeField] private float cursorForceVelocityScale = 0.035f;
     [SerializeField] private Color cursorInsideColor = new Color(0.72f, 0.92f, 1f, 0.86f);
+
+    [Header("Clear")]
+    [SerializeField] private float clearEdgeMargin = 0f;
 
     [Header("Debug")]
     [SerializeField] private CursorState currentRegion;
@@ -58,6 +68,7 @@ public class Slime : MonoBehaviour
     private Vector2 pushStartVirtualPos;
     private Vector2 pushStartRealPos;
     private Vector2 pushDirection;
+    private Vector2 pushSurfaceDirection;
     private Vector2 invisibleCircleCenter;
     private Vector2 innerInvisibleCircleCenter;
     private float invisibleCircleRadius;
@@ -65,6 +76,7 @@ public class Slime : MonoBehaviour
     private Vector2 releaseTarget;
     private float releaseTimer;
     private Vector3 slimeBaseScale = Vector3.one;
+    private bool hasCleared;
 
     private const float MinMoveForDirection = 0.05f;
 
@@ -123,6 +135,25 @@ public class Slime : MonoBehaviour
             viscositySlider = FindAnyObjectByType<Slider>();
         }
 
+        if (pushSlimObject == null)
+        {
+            pushSlimObject = FindSceneObjectByName("Push_Slim");
+            if (pushSlimObject == null)
+            {
+                pushSlimObject = FindSceneObjectByName("Push_Slime");
+            }
+        }
+
+        if (clearObject == null)
+        {
+            clearObject = FindSceneObjectByName("Clear");
+        }
+
+        if (clearObject != null)
+        {
+            clearObject.SetActive(false);
+        }
+
         canvasRect = canvas != null ? canvas.transform as RectTransform : null;
         bodyImage = slimeBody != null ? slimeBody.GetComponent<Image>() : null;
         cursorImage = customCursor != null ? customCursor.GetComponent<Image>() : null;
@@ -138,10 +169,10 @@ public class Slime : MonoBehaviour
 
         if (viscositySlider != null)
         {
-            viscositySlider.minValue = 0.03f;
-            viscositySlider.maxValue = 0.18f;
-            viscositySlider.SetValueWithoutNotify(insideViscosity);
-            viscositySlider.onValueChanged.AddListener(SetInsideViscosity);
+            viscositySlider.minValue = 0f;
+            viscositySlider.maxValue = 1f;
+            viscositySlider.SetValueWithoutNotify(insideViscosityAmount);
+            viscositySlider.onValueChanged.AddListener(SetInsideViscosityAmount);
         }
     }
 
@@ -157,6 +188,11 @@ public class Slime : MonoBehaviour
 
     private void Update()
     {
+        if (hasCleared)
+        {
+            return;
+        }
+
         if (canvasRect == null || customCursor == null || outerCollider == null || slimeBody == null)
         {
             return;
@@ -185,12 +221,13 @@ public class Slime : MonoBehaviour
         customCursor.SetAsLastSibling();
         customCursor.anchoredPosition = displayCursorCanvasPosition;
         UpdateVisuals();
+        CheckClearCondition();
         previousRealCursorPosition = rawMouseCanvasPosition;
     }
 
-    public void SetInsideViscosity(float value)
+    public void SetInsideViscosityAmount(float value)
     {
-        insideViscosity = Mathf.Clamp(value, 0.01f, 0.5f);
+        insideViscosityAmount = Mathf.Clamp01(value);
     }
 
     private void UpdateOutside()
@@ -225,7 +262,8 @@ public class Slime : MonoBehaviour
             fromCenter = rawMouseCanvasPosition - slimeCenter;
         }
 
-        pushStartVirtualPos = slimeCenter + fromCenter.normalized * (slimeRadius + surfaceStickOffset);
+        pushSurfaceDirection = fromCenter.sqrMagnitude > 0.001f ? fromCenter.normalized : Vector2.up;
+        pushStartVirtualPos = slimeCenter + pushSurfaceDirection * (slimeRadius + surfaceStickOffset);
         pushStartRealPos = rawMouseCanvasPosition;
         pushDirection = (rawMouseCanvasPosition - pushStartVirtualPos).sqrMagnitude > 0.001f
             ? (rawMouseCanvasPosition - pushStartVirtualPos).normalized
@@ -240,12 +278,20 @@ public class Slime : MonoBehaviour
     {
         Vector2 slimeCenter = GetSlimeCenter();
         float slimeRadius = GetSlimeRadius();
-        Vector2 surfaceDirection = (pushStartVirtualPos - slimeCenter).normalized;
+        Vector2 surfaceDirection = pushSurfaceDirection.sqrMagnitude > 0.001f ? pushSurfaceDirection.normalized : (pushStartVirtualPos - slimeCenter).normalized;
         Vector2 surfacePoint = slimeCenter + surfaceDirection * (slimeRadius + surfaceStickOffset);
 
         float jitter = Mathf.Sin(Time.unscaledTime * 56f) * cursorJitterAmount;
         Vector2 tangent = new Vector2(-surfaceDirection.y, surfaceDirection.x);
         virtualCursorPosition = surfacePoint + tangent * jitter;
+
+        if (IsMovingToward(slimeCenter - virtualCursorPosition, pushDotThreshold))
+        {
+            ApplySlimeForce(pushDirection, outerMembraneForceSpeed);
+            slimeCenter = GetSlimeCenter();
+            surfacePoint = slimeCenter + surfaceDirection * (slimeRadius + surfaceStickOffset);
+            virtualCursorPosition = surfacePoint + tangent * jitter;
+        }
 
         float signedDepth = Vector2.Dot(rawMouseCanvasPosition - invisibleCircleCenter, pushDirection);
         if (signedDepth >= 0f)
@@ -303,9 +349,13 @@ public class Slime : MonoBehaviour
         float slimeRadius = GetSlimeRadius();
         Vector2 fromInnerCenter = rawMouseCanvasPosition - innerInvisibleCircleCenter;
         float realDistance = fromInnerCenter.magnitude;
+        Vector2 pullDirection = fromInnerCenter.sqrMagnitude > 0.001f
+            ? fromInnerCenter.normalized
+            : (virtualCursorPosition - slimeCenter).normalized;
 
         if (realDistance >= innerInvisibleCircleRadius)
         {
+            ApplySlimeForce(pullDirection, innerMembraneForceSpeed);
             virtualCursorPosition = Vector2.Lerp(virtualCursorPosition, rawMouseCanvasPosition, exitLerpRate);
             if (Vector2.Distance(virtualCursorPosition, rawMouseCanvasPosition) < membraneThickness)
             {
@@ -317,8 +367,13 @@ public class Slime : MonoBehaviour
 
         if (realDistance > slimeRadius * 0.35f)
         {
-            Vector2 direction = fromInnerCenter.sqrMagnitude > 0.001f ? fromInnerCenter.normalized : (virtualCursorPosition - slimeCenter).normalized;
-            virtualCursorPosition = slimeCenter + direction * Mathf.Max(1f, slimeRadius - membraneThickness * 0.5f);
+            if (IsMovingToward(pullDirection, exitDotThreshold))
+            {
+                ApplySlimeForce(pullDirection, innerMembraneForceSpeed);
+                slimeCenter = GetSlimeCenter();
+            }
+
+            virtualCursorPosition = slimeCenter + pullDirection * Mathf.Max(1f, slimeRadius - membraneThickness * 0.5f);
         }
         else
         {
@@ -393,9 +448,77 @@ public class Slime : MonoBehaviour
         return Vector2.Distance(virtualCursorPosition, GetSlimeCenter()) < GetSlimeRadius();
     }
 
+    private void ApplySlimeForce(Vector2 direction, float baseSpeed)
+    {
+        if (slimeBody == null || direction.sqrMagnitude < 0.001f)
+        {
+            return;
+        }
+
+        float velocityBoost = Vector2.Dot(realCursorVelocity, direction.normalized) * cursorForceVelocityScale;
+        float forceSpeed = Mathf.Max(baseSpeed, baseSpeed + velocityBoost);
+        slimeBody.anchoredPosition += direction.normalized * forceSpeed * Time.unscaledDeltaTime;
+    }
+
+    private void CheckClearCondition()
+    {
+        Vector2 slimeCenter = GetSlimeCenter();
+        float slimeRadius = GetSlimeRadius();
+        Rect canvasBounds = canvasRect.rect;
+
+        bool isFullyOutside =
+            slimeCenter.x + slimeRadius < canvasBounds.xMin - clearEdgeMargin ||
+            slimeCenter.x - slimeRadius > canvasBounds.xMax + clearEdgeMargin ||
+            slimeCenter.y + slimeRadius < canvasBounds.yMin - clearEdgeMargin ||
+            slimeCenter.y - slimeRadius > canvasBounds.yMax + clearEdgeMargin;
+
+        if (isFullyOutside)
+        {
+            Clear();
+        }
+    }
+
+    private void Clear()
+    {
+        hasCleared = true;
+
+        if (pushSlimObject != null)
+        {
+            pushSlimObject.SetActive(false);
+        }
+
+        if (clearObject != null)
+        {
+            clearObject.SetActive(true);
+            clearObject.transform.SetAsLastSibling();
+        }
+    }
+
+    private GameObject FindSceneObjectByName(string objectName)
+    {
+        GameObject activeObject = GameObject.Find(objectName);
+        if (activeObject != null)
+        {
+            return activeObject;
+        }
+
+        GameObject[] allObjects = Resources.FindObjectsOfTypeAll<GameObject>();
+        for (int i = 0; i < allObjects.Length; i++)
+        {
+            GameObject candidate = allObjects[i];
+            if (candidate.name == objectName && candidate.scene.IsValid())
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
     private float GetEffectiveInsideViscosity()
     {
-        return Mathf.Clamp01(insideViscosity * insideDragMultiplier);
+        float followRate = Mathf.Lerp(maxInsideFollowRate, minInsideFollowRate, insideViscosityAmount);
+        return Mathf.Clamp01(followRate * insideDragMultiplier);
     }
 
     private bool IsRealCursorInPushLane()
